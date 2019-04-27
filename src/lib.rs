@@ -285,6 +285,7 @@ use std::path::Path;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use openssl::sign::Signer;
 use openssl::hash::{hash, MessageDigest};
@@ -298,6 +299,8 @@ use error::{Result, ErrorKind};
 
 use serde_json::{Value, from_str, to_string, to_value};
 use serde::Serialize;
+use std::thread::sleep;
+use std::time::Duration;
 
 /// Default Let's Encrypt directory URL to configure client.
 pub const LETSENCRYPT_DIRECTORY_URL: &'static str = "https://acme-v01.api.letsencrypt.org\
@@ -378,6 +381,12 @@ pub struct Challenge<'a> {
     key_authorization: String,
 }
 
+/// Validation status
+pub enum ValidationStatus {
+    Pending,
+    Valid,
+    Invalid(Value)
+}
 
 impl Directory {
     /// Creates a Directory from
@@ -531,7 +540,7 @@ impl Directory {
     /// Returns jwk field of jws header
     fn jwk(&self, pkey: &PKey<openssl::pkey::Private>) -> Result<Value> {
         let rsa = pkey.rsa()?;
-        let mut jwk: HashMap<String, String> = HashMap::new();
+        let mut jwk: BTreeMap<String, String> = BTreeMap::new();
         jwk.insert("e".to_owned(),
                    b64(&rsa.e().to_vec()));
         jwk.insert("kty".to_owned(), "RSA".to_owned());
@@ -977,6 +986,15 @@ impl<'a> Challenge<'a> {
         Ok(())
     }
 
+    pub fn remove_key_authorization<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        use std::fs::remove_file;
+        let path = path.as_ref().join(".well-known").join("acme-challenge").join(&self.token);
+
+        remove_file(path)?;
+
+        Ok(())
+    }
+
     /// Gets DNS validation signature.
     ///
     /// This value is used for verification of domain over DNS. Signature must be saved
@@ -1002,7 +1020,7 @@ impl<'a> Challenge<'a> {
     }
 
     /// Triggers validation.
-    pub fn validate(&self) -> Result<()> {
+    pub fn start_validation(&self) -> Result<()> {
         info!("Triggering {} validation", self.ctype);
         let payload = {
             let map = {
@@ -1020,41 +1038,60 @@ impl<'a> Challenge<'a> {
         let client = Client::new();
         let mut resp = client.post(&self.url).body(payload).send()?;
 
-        let mut res_json: Value = {
+        let res_json: Value = {
             let mut res_content = String::new();
             resp.read_to_string(&mut res_content)?;
             from_str(&res_content)?
         };
 
-        if resp.status() != StatusCode::ACCEPTED {
-            return Err(ErrorKind::AcmeServerError(res_json).into());
+        if resp.status() == StatusCode::ACCEPTED {
+            Ok(())
+        } else {
+            Err(ErrorKind::AcmeServerError(res_json).into())
         }
+    }
+
+    pub fn check_validation_status(&self) -> Result<ValidationStatus> {
+        let client = Client::new();
+        let mut resp = client.get(&self.url).send()?;
+        let res_json: Value = {
+            let mut res_content = String::new();
+            resp.read_to_string(&mut res_content)?;
+            from_str(&res_content)?
+        };
+
+        let status = res_json
+            .as_object()
+            .and_then(|o| o.get("status"))
+            .and_then(|s| s.as_str())
+            .ok_or("Status not found")?
+            .to_owned();
+
+        match status.as_ref() {
+            "pending" => Ok(ValidationStatus::Pending),
+            "valid" => Ok(ValidationStatus::Valid),
+            "invalid" => Ok(ValidationStatus::Invalid(res_json)),
+            _ => Err(ErrorKind::AcmeServerError(res_json).into())
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.start_validation()?;
 
         loop {
-            let status = res_json
-                .as_object()
-                .and_then(|o| o.get("status"))
-                .and_then(|s| s.as_str())
-                .ok_or("Status not found")?
-                .to_owned();
+            match self.check_validation_status() {
+                Ok(ValidationStatus::Pending) => {
+                    debug!("Status is pending, trying again in 2 seconds...");
+                    sleep(Duration::from_secs(2));
+                },
 
-            if status == "pending" {
-                debug!("Status is pending, trying again...");
-                let mut resp = client.get(&self.url).send()?;
-                res_json = {
-                    let mut res_content = String::new();
-                    resp.read_to_string(&mut res_content)?;
-                    from_str(&res_content)?
-                };
-            } else if status == "valid" {
-                return Ok(());
-            } else if status == "invalid" {
-                return Err(ErrorKind::AcmeServerError(res_json).into());
+                Ok(ValidationStatus::Valid) => {
+                    break Ok(())
+                },
+
+                Ok(ValidationStatus::Invalid(res_json)) => break Err(ErrorKind::AcmeServerError(res_json).into()),
+                Err(e) => break Err(e)
             }
-
-            use std::thread::sleep;
-            use std::time::Duration;
-            sleep(Duration::from_secs(2));
         }
     }
 }
